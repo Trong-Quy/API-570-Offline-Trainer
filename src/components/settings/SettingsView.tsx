@@ -8,6 +8,8 @@ export function SettingsView() {
 
   const [endpoint, setEndpoint] = useState(settings.aiEndpoint);
   const [model, setModel] = useState(settings.aiModel);
+  const [cleanupModel, setCleanupModel] = useState(settings.cleanupModel);
+  const [translateModel, setTranslateModel] = useState(settings.translateModel);
   const [timerSec, setTimerSec] = useState(settings.examTimerSeconds);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -19,6 +21,8 @@ export function SettingsView() {
     saveSettings({
       aiEndpoint: endpoint,
       aiModel: model,
+      cleanupModel,
+      translateModel,
       examTimerSeconds: timerSec,
       aiEnabled: true,
     });
@@ -52,11 +56,11 @@ export function SettingsView() {
   };
 
   const SUGGESTED_MODELS = [
-    { id: "qwen2.5:7b", label: "Qwen 2.5 7B (Recommended)", desc: "Good balance of speed and quality on M1" },
+    { id: "deepseek-r1:14b", label: "DeepSeek R1 14B (Best for API 570)", desc: "Best reasoning & unit handling for technical calculations — fits M1 16GB" },
+    { id: "qwen2.5:14b", label: "Qwen 2.5 14B", desc: "Strong technical knowledge, accurate instruction following" },
+    { id: "qwen2.5:7b", label: "Qwen 2.5 7B", desc: "Good balance of speed and quality on M1" },
+    { id: "deepseek-r1:7b", label: "DeepSeek R1 7B", desc: "Reasoning model, smaller footprint" },
     { id: "mistral:7b", label: "Mistral 7B", desc: "Strong reasoning, widely supported" },
-    { id: "phi3:mini", label: "Phi-3 Mini", desc: "Very fast, lower RAM usage" },
-    { id: "llama3.2:3b", label: "Llama 3.2 3B", desc: "Fastest option, lower accuracy" },
-    { id: "deepseek-r1:7b", label: "DeepSeek R1 7B", desc: "Excellent reasoning for technical content" },
   ];
 
   return (
@@ -111,6 +115,42 @@ export function SettingsView() {
             <p className="text-xs text-[#444] mt-1">
               {SUGGESTED_MODELS.find((m) => m.id === model)?.desc ?? "Custom model ID"}
             </p>
+          </div>
+
+          {/* Translation Pipeline */}
+          <div className="border-t border-[#2a2a2a] pt-4 space-y-3">
+            <p className="text-xs text-[#666] font-medium">Translation Pipeline (PDF Codebook)</p>
+            <div className="bg-[#0f0f0f] rounded-lg px-3 py-2 text-[10px] text-[#555] flex items-center gap-2">
+              <span className="text-[#f97316]">OCR</span>
+              <span>minicpm-v:8b</span>
+              <span className="text-[#333]">→</span>
+              <span className="text-[#818cf8]">Cleanup</span>
+              <span>{cleanupModel}</span>
+              <span className="text-[#333]">→</span>
+              <span className="text-[#22c55e]">Translate</span>
+              <span>{translateModel}</span>
+            </div>
+            <div>
+              <label className="text-xs text-[#666] mb-1.5 block">Cleanup Model <span className="text-[#444]">(sửa lỗi OCR, format kỹ thuật)</span></label>
+              <input
+                type="text"
+                value={cleanupModel}
+                onChange={(e) => setCleanupModel(e.target.value)}
+                className="w-full bg-[#0f0f0f] border border-[#2a2a2a] rounded-lg px-3 py-2 text-sm text-[#818cf8] focus:outline-none focus:border-[#818cf8]"
+                placeholder="deepseek-r1:14b"
+              />
+            </div>
+            <div>
+              <label className="text-xs text-[#666] mb-1.5 block">Translate Model <span className="text-[#444]">(dịch sang tiếng Việt)</span></label>
+              <input
+                type="text"
+                value={translateModel}
+                onChange={(e) => setTranslateModel(e.target.value)}
+                className="w-full bg-[#0f0f0f] border border-[#2a2a2a] rounded-lg px-3 py-2 text-sm text-[#22c55e] focus:outline-none focus:border-[#22c55e]"
+                placeholder="translategemma:12b"
+              />
+              <p className="text-[10px] text-[#444] mt-1">Khi pull xong translategemma:12b, nhập vào đây và Save</p>
+            </div>
           </div>
 
           <div className="flex gap-2">

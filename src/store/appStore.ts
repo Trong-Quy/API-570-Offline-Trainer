@@ -8,6 +8,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   aiEnabled: true,
   examTimerSeconds: 90,
   darkMode: true,
+  cleanupModel: "deepseek-r1:14b",
+  translateModel: "qwen2.5:7b",
 };
 
 function loadSettings(): AppSettings {

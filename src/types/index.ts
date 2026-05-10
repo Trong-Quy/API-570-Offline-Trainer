@@ -112,6 +112,8 @@ export interface AppSettings {
   aiEnabled: boolean;
   examTimerSeconds: number;
   darkMode: boolean;
+  cleanupModel: string;
+  translateModel: string;
 }
 
 export type ExamMode = "timed" | "open-book" | "practice" | "adaptive";

@@ -315,6 +315,13 @@ fn update_pdf_last_page(app: AppHandle, pdf_id: i64, page: i32) -> Result<(), St
 }
 
 #[tauri::command]
+fn delete_pdf(app: AppHandle, pdf_id: i64) -> Result<(), String> {
+    let conn = open_db(&app).map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM pdfs WHERE id=?1", params![pdf_id]).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
 fn get_exam_history(app: AppHandle) -> Result<Vec<serde_json::Value>, String> {
     let conn = open_db(&app).map_err(|e| e.to_string())?;
     let mut stmt = conn.prepare(
@@ -698,6 +705,7 @@ pub fn run() {
             add_pdf,
             get_pdfs,
             update_pdf_last_page,
+            delete_pdf,
             get_exam_history,
             seed_questions,
             get_notes,

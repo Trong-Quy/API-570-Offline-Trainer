@@ -36,6 +36,7 @@ const SYSTEM_PROMPT = `You are an API 570 Piping Inspector certification exam qu
 - Explanation must cite the specific code clause
 - difficulty: 1=easy, 2=medium, 3=hard, 4=expert
 - correct_answer must be exactly "A", "B", "C", or "D"
+- For calculation questions: use a single consistent unit system throughout; mpy = mils per year (NOT mm/year); verify units cancel before computing; show the formula with units in the explanation
 
 Return ONLY a JSON object with this exact structure, no other text:
 {

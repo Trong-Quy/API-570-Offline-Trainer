@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import * as pdfjs from "pdfjs-dist";
 import type { PageViewport } from "pdfjs-dist";
@@ -15,7 +15,7 @@ interface PdfTextItem {
 import {
   ChevronLeft, ChevronRight, ZoomIn, ZoomOut, Bookmark,
   Upload, FileText, Search, List, X, ChevronUp, ChevronDown,
-  AlertCircle, Loader2
+  AlertCircle, Loader2, Languages, ClipboardPaste, Copy, StopCircle, ScanLine
 } from "lucide-react";
 import { useAppStore } from "../../store/appStore";
 import type { PDF } from "../../types";
@@ -57,7 +57,7 @@ const normalizeClause = (s: string) => s.replace(/^§\s*/, "").trim();
 
 // ── PDFViewer ─────────────────────────────────────────────────────────────
 export function PDFViewer() {
-  const { pdfs, loadPdfs, loadBookmarks, activePdf, setActivePdf } = useAppStore();
+  const { pdfs, loadPdfs, loadBookmarks, activePdf, setActivePdf, settings, aiStatus } = useAppStore();
 
   // ── PDF state ─────────────────────────────────────────────────────────
   const [pdfDoc, setPdfDoc] = useState<pdfjs.PDFDocumentProxy | null>(null);
@@ -86,6 +86,171 @@ export function PDFViewer() {
   const [showResults, setShowResults] = useState(false);
   const searchDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
+
+  // ── Translate panel ───────────────────────────────────────────────────
+  const [showTranslate, setShowTranslate] = useState(false);
+  const [translateInput, setTranslateInput] = useState("");
+  const [translating, setTranslating] = useState(false);
+  const [translateResult, setTranslateResult] = useState("");
+  const translateAbort = useRef<AbortController | null>(null);
+
+  // ── Pipeline ──────────────────────────────────────────────────────────
+  const [ocring, setOcring] = useState(false);
+  const [pipelineStage, setPipelineStage] = useState<"idle" | "ocr" | "cleanup" | "translate">("idle");
+  const ocrAbort = useRef<AbortController | null>(null);
+  const OCR_MODELS = ["minicpm-v:8b", "llava:13b"];
+
+  const ocrCurrentPage = async () => {
+    if (!canvasRef.current || ocring || aiStatus !== "online") return;
+    setOcring(true);
+    setTranslateInput("");
+    setTranslateResult("");
+    ocrAbort.current = new AbortController();
+    const signal = ocrAbort.current.signal;
+
+    // Resize canvas to max 1400px
+    const src = canvasRef.current;
+    const ratio = Math.min(1, 1400 / src.width);
+    const off = document.createElement("canvas");
+    off.width = Math.round(src.width * ratio);
+    off.height = Math.round(src.height * ratio);
+    off.getContext("2d")!.drawImage(src, 0, 0, off.width, off.height);
+    const base64 = off.toDataURL("image/jpeg", 0.88).split(",")[1];
+
+    try {
+      // Stage 1: OCR
+      setPipelineStage("ocr");
+      let rawText = "";
+      for (const ocrModel of OCR_MODELS) {
+        if (signal.aborted) break;
+        try {
+          rawText = await streamOllama(
+            ocrModel,
+            "Extract ALL text from this document image exactly as it appears. Preserve paragraph structure, line breaks, headings, and numbering. Output ONLY the extracted text with no commentary.",
+            signal,
+            (t) => setTranslateInput(t),
+            [base64],
+          );
+          if (rawText.trim()) break;
+        } catch (e: any) {
+          if (e.name === "AbortError") throw e;
+        }
+      }
+      if (!rawText.trim() || signal.aborted) return;
+
+      // Stage 2: Cleanup
+      setPipelineStage("cleanup");
+      const cleaned = await runCleanup(rawText, signal);
+      if (signal.aborted) return;
+
+      // Stage 3: Translate
+      setPipelineStage("translate");
+      await runTranslate(cleaned, signal);
+    } catch (e: any) {
+      if (e.name !== "AbortError") {
+        setTranslateInput("Pipeline thất bại. Kiểm tra minicpm-v:8b và Ollama đang chạy.");
+      }
+    } finally {
+      setOcring(false);
+      setPipelineStage("idle");
+    }
+  };
+
+  // Shared streaming helper — returns full text, calls onChunk for each token
+  const streamOllama = async (
+    model: string,
+    prompt: string,
+    signal: AbortSignal,
+    onChunk: (full: string) => void,
+    images?: string[],
+  ): Promise<string> => {
+    const body: Record<string, unknown> = { model, prompt, stream: true };
+    if (images?.length) body.images = images;
+    const res = await fetch(`${settings.aiEndpoint}/api/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal,
+    });
+    if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let full = "";
+    let buf = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const obj = JSON.parse(line);
+          if (obj.response) { full += obj.response; onChunk(full); }
+          if (obj.done) return full;
+        } catch { /* skip */ }
+      }
+    }
+    return full;
+  };
+
+  const loadPageText = useCallback(() => {
+    const data = textIndex.get(currentPage);
+    setTranslateInput(data?.full ?? "");
+    setTranslateResult("");
+  }, [textIndex, currentPage]);
+
+  // Auto-reload translate text when page changes or indexing finishes
+  useEffect(() => {
+    if (showTranslate) loadPageText();
+  }, [currentPage, showTranslate, loadPageText]);
+
+  // Stage 2: Cleanup OCR text with deepseek-r1
+  const runCleanup = async (rawText: string, signal: AbortSignal): Promise<string> => {
+    const prompt = `You are cleaning up OCR-extracted text from a technical API/ASME document. Fix:
+- Broken words split across lines (e.g. "cor- rosion" → "corrosion")
+- Wrong characters from OCR errors
+- Restore paragraph structure and headings
+- Keep ALL clause numbers, measurements, and technical terms exactly
+Output ONLY the cleaned text, nothing else:\n\n${rawText}`;
+    return streamOllama(settings.cleanupModel, prompt, signal, (t) => setTranslateInput(t));
+  };
+
+  // Stage 3: Translate with translateModel
+  const runTranslate = async (text: string, signal: AbortSignal): Promise<void> => {
+    const prompt = `Translate the following technical API/ASME piping inspection document to Vietnamese. Rules:
+- Preserve ALL clause numbers (e.g. 6.1.2), measurements, unit abbreviations exactly
+- Keep technical terms in English on first use, add Vietnamese in parentheses
+- Maintain document structure (headings, lists, paragraphs)
+Output ONLY the Vietnamese translation:\n\n${text}`;
+    await streamOllama(settings.translateModel, prompt, signal, (t) => setTranslateResult(t));
+  };
+
+  // Full pipeline: Cleanup → Translate (for digital PDFs)
+  const translateWithAI = async () => {
+    const text = translateInput.trim();
+    if (!text || translating || aiStatus !== "online") return;
+    setTranslating(true);
+    setTranslateResult("");
+    translateAbort.current = new AbortController();
+    const signal = translateAbort.current.signal;
+    try {
+      // Cleanup stage
+      setPipelineStage("cleanup");
+      const cleaned = await runCleanup(text, signal);
+      if (signal.aborted) return;
+
+      // Translate stage
+      setPipelineStage("translate");
+      await runTranslate(cleaned, signal);
+    } catch (e: any) {
+      if (e.name !== "AbortError") setTranslateResult("Lỗi pipeline. Kiểm tra Ollama đang chạy.");
+    } finally {
+      setTranslating(false);
+      setPipelineStage("idle");
+    }
+  };
 
   // ── Canvas / viewport ─────────────────────────────────────────────────
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -337,7 +502,7 @@ export function PDFViewer() {
       setSearchResults([]);
       setShowResults(false);
 
-      const doc = await pdfjs.getDocument(pdf.path).promise;
+      const doc = await pdfjs.getDocument(convertFileSrc(pdf.path)).promise;
       setPdfDoc(doc);
       setTotalPages(doc.numPages);
       const startPage = Math.min(pdf.lastPage || 1, doc.numPages);
@@ -365,6 +530,16 @@ export function PDFViewer() {
       await invoke("add_pdf", { name, path });
       await loadPdfs();
     } catch (e) { console.error("Import failed:", e); }
+  };
+
+  const deletePdf = async (pdf: PDF, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!confirm(`Xóa "${pdf.name}" khỏi thư viện?\n(File PDF gốc sẽ không bị xóa)`)) return;
+    try {
+      await invoke("delete_pdf", { pdfId: pdf.id });
+      await loadPdfs();
+      if (activePdf?.id === pdf.id) setActivePdf(null as any);
+    } catch (e) { console.error("Delete failed:", e); }
   };
 
   const addBookmark = async () => {
@@ -421,11 +596,23 @@ export function PDFViewer() {
           ) : (
             <div className="grid grid-cols-3 gap-4">
               {pdfs.map((pdf) => (
-                <button key={pdf.id} onClick={() => openPdf(pdf)} className="bg-[#111] border border-[#2a2a2a] rounded-xl p-4 text-left hover:border-[#f5c842]/30 transition-colors group">
-                  <FileText size={24} className="text-[#818cf8] mb-3" />
-                  <p className="text-[#e5e5e5] text-sm font-medium group-hover:text-[#f5c842]">{pdf.name}</p>
-                  <p className="text-[#555] text-xs mt-1">Last page: {pdf.lastPage}</p>
-                </button>
+                <div key={pdf.id} className="relative group">
+                  <button
+                    onClick={() => openPdf(pdf)}
+                    className="w-full bg-[#111] border border-[#2a2a2a] rounded-xl p-4 text-left hover:border-[#f5c842]/30 transition-colors"
+                  >
+                    <FileText size={24} className="text-[#818cf8] mb-3" />
+                    <p className="text-[#e5e5e5] text-sm font-medium group-hover:text-[#f5c842] pr-6">{pdf.name}</p>
+                    <p className="text-[#555] text-xs mt-1">Last page: {pdf.lastPage}</p>
+                  </button>
+                  <button
+                    onClick={(e) => deletePdf(pdf, e)}
+                    title="Xóa khỏi thư viện"
+                    className="absolute top-2.5 right-2.5 w-6 h-6 rounded-md bg-[#1a1a1a] border border-[#2a2a2a] text-[#555] hover:bg-[#ef4444]/15 hover:border-[#ef4444]/40 hover:text-[#ef4444] flex items-center justify-center opacity-0 group-hover:opacity-100 transition-all"
+                  >
+                    <X size={12} />
+                  </button>
+                </div>
               ))}
               <button onClick={importPdf} className="bg-[#111] border border-dashed border-[#2a2a2a] rounded-xl p-4 flex flex-col items-center justify-center hover:border-[#3a3a3a] transition-colors">
                 <Upload size={20} className="text-[#444] mb-2" />
@@ -576,6 +763,20 @@ export function PDFViewer() {
           )}
         </div>
 
+        {/* Translate button */}
+        <button
+          onClick={() => { setShowTranslate(v => !v); if (!showTranslate) loadPageText(); }}
+          title="Dịch sang tiếng Việt"
+          className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs transition-colors shrink-0 ${
+            showTranslate
+              ? "border-[#22c55e]/40 text-[#22c55e] bg-[#22c55e]/10"
+              : "border-[#2a2a2a] text-[#777] hover:text-[#22c55e] hover:border-[#22c55e]/30"
+          }`}
+        >
+          <Languages size={13} />
+          <span className="text-[10px]">Dịch</span>
+        </button>
+
         {/* Bookmark button */}
         <button
           onClick={() => setShowBookmarkForm(v => !v)}
@@ -650,6 +851,161 @@ export function PDFViewer() {
           style={{ maxWidth: "100%", height: "auto" }}
         />
       </div>
+
+      {/* Translate panel */}
+      {showTranslate && (
+        <div className="shrink-0 border-t border-[#22c55e]/20 bg-[#0d0d0d]" style={{ height: 300 }}>
+          <div className="flex items-center justify-between px-3 py-2 border-b border-[#1a1a1a]">
+            <div className="flex items-center gap-2">
+              <Languages size={13} className="text-[#22c55e]" />
+              <span className="text-[11px] text-[#22c55e] font-medium">Dịch sang tiếng Việt</span>
+              {pipelineStage !== "idle" ? (
+                <div className="flex items-center gap-1.5 ml-1">
+                  {(["ocr", "cleanup", "translate"] as const).map((s, i) => (
+                    <span key={s} className="flex items-center gap-1">
+                      {i > 0 && <span className="text-[#333] text-[10px]">→</span>}
+                      <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium flex items-center gap-1 ${
+                        pipelineStage === s
+                          ? s === "ocr" ? "bg-[#f97316]/20 text-[#f97316]"
+                            : s === "cleanup" ? "bg-[#818cf8]/20 text-[#818cf8]"
+                            : "bg-[#22c55e]/20 text-[#22c55e]"
+                          : "text-[#333]"
+                      }`}>
+                        {pipelineStage === s && <Loader2 size={9} className="animate-spin" />}
+                        {s === "ocr" ? "OCR" : s === "cleanup" ? "Cleanup" : "Translate"}
+                      </span>
+                    </span>
+                  ))}
+                </div>
+              ) : (
+                <span className="text-[10px] text-[#444]">— chỉnh sửa văn bản bên trái trước khi dịch</span>
+              )}
+            </div>
+            <div className="flex items-center gap-1.5">
+              <button
+                onClick={loadPageText}
+                title="Load lại text trang hiện tại"
+                className="flex items-center gap-1 px-2 py-1 rounded text-[10px] text-[#666] hover:text-[#e5e5e5] border border-[#2a2a2a] hover:border-[#3a3a3a] transition-colors"
+              >
+                <ClipboardPaste size={10} /> Trang {currentPage}
+              </button>
+              {ocring ? (
+                <button
+                  onClick={() => { ocrAbort.current?.abort(); setOcring(false); }}
+                  className="flex items-center gap-1 px-2.5 py-1 rounded text-[10px] bg-[#f97316]/15 text-[#f97316] border border-[#f97316]/30 hover:bg-[#f97316]/25 transition-colors"
+                >
+                  <StopCircle size={10} /> Dừng OCR
+                </button>
+              ) : (
+                <button
+                  onClick={ocrCurrentPage}
+                  disabled={aiStatus !== "online"}
+                  title="Dùng AI vision để trích xuất text từ ảnh (minicpm-v:8b)"
+                  className="flex items-center gap-1 px-2.5 py-1 rounded text-[10px] bg-[#f97316]/15 text-[#f97316] border border-[#f97316]/30 hover:bg-[#f97316]/25 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                >
+                  <ScanLine size={10} /> OCR
+                </button>
+              )}
+              {translating ? (
+                <button
+                  onClick={() => { translateAbort.current?.abort(); setTranslating(false); }}
+                  className="flex items-center gap-1 px-2.5 py-1 rounded text-[10px] bg-[#ef4444]/15 text-[#ef4444] border border-[#ef4444]/30 hover:bg-[#ef4444]/25 transition-colors"
+                >
+                  <StopCircle size={10} /> Dừng
+                </button>
+              ) : (
+                <button
+                  onClick={translateWithAI}
+                  disabled={!translateInput.trim() || aiStatus !== "online"}
+                  className="flex items-center gap-1 px-2.5 py-1 rounded text-[10px] bg-[#22c55e]/15 text-[#22c55e] border border-[#22c55e]/30 hover:bg-[#22c55e]/25 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                >
+                  <Languages size={10} /> Dịch
+                </button>
+              )}
+              <button onClick={() => setShowTranslate(false)} className="text-[#444] hover:text-[#888] p-0.5">
+                <X size={13} />
+              </button>
+            </div>
+          </div>
+          <div className="flex h-[calc(100%-37px)]">
+            {/* Input — editable page text */}
+            <div className="flex-1 flex flex-col border-r border-[#1a1a1a]">
+              <div className="px-2 py-1 border-b border-[#1a1a1a] flex items-center justify-between">
+                <span className="text-[10px] text-[#444]">Văn bản gốc (có thể chỉnh sửa)</span>
+                {translateInput && (
+                  <button
+                    onClick={() => navigator.clipboard.writeText(translateInput)}
+                    className="text-[#444] hover:text-[#888]"
+                  >
+                    <Copy size={10} />
+                  </button>
+                )}
+              </div>
+              {indexing && !textIndex.has(currentPage) && !translateInput && !ocring ? (
+                <div className="flex-1 flex items-center justify-center gap-2 text-[#444] text-[11px]">
+                  <Loader2 size={12} className="animate-spin text-[#818cf8]" />
+                  <span>Đang index trang {currentPage}… ({indexPct}%)</span>
+                </div>
+              ) : !textIndex.has(currentPage) && !translateInput && !ocring ? (
+                <div className="flex-1 flex flex-col items-center justify-center gap-3 px-4 text-center">
+                  <ScanLine size={20} className="text-[#444]" />
+                  <p className="text-[11px] text-[#555]">Trang này không có text layer (PDF scan)</p>
+                  <button
+                    onClick={ocrCurrentPage}
+                    disabled={aiStatus !== "online"}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] bg-[#f97316]/15 text-[#f97316] border border-[#f97316]/30 hover:bg-[#f97316]/25 disabled:opacity-30 disabled:cursor-not-allowed transition-colors font-medium"
+                  >
+                    <ScanLine size={12} /> OCR trang này bằng AI
+                  </button>
+                  <p className="text-[10px] text-[#333]">minicpm-v:8b · chạy offline</p>
+                </div>
+              ) : (
+                <div className="flex-1 flex flex-col overflow-hidden">
+                  {ocring && (
+                    <div className="flex items-center gap-2 px-3 py-1.5 bg-[#f97316]/8 border-b border-[#f97316]/20 shrink-0">
+                      <Loader2 size={10} className="animate-spin text-[#f97316]" />
+                      <span className="text-[10px] text-[#f97316]">OCR đang chạy… {translateInput.length} ký tự</span>
+                    </div>
+                  )}
+                  <textarea
+                    value={translateInput}
+                    onChange={e => setTranslateInput(e.target.value)}
+                    className="flex-1 bg-transparent text-[11px] text-[#888] placeholder-[#333] px-3 py-2 resize-none focus:outline-none leading-relaxed"
+                    placeholder="Paste text vào đây để dịch…"
+                  />
+                </div>
+              )}
+            </div>
+            {/* Output — translation result */}
+            <div className="flex-1 flex flex-col">
+              <div className="px-2 py-1 border-b border-[#1a1a1a] flex items-center justify-between">
+                <span className="text-[10px] text-[#444]">Bản dịch tiếng Việt</span>
+                {translateResult && (
+                  <button
+                    onClick={() => navigator.clipboard.writeText(translateResult)}
+                    className="text-[#444] hover:text-[#888]"
+                  >
+                    <Copy size={10} />
+                  </button>
+                )}
+              </div>
+              <div className="flex-1 overflow-y-auto px-3 py-2">
+                {translating && !translateResult && (
+                  <div className="flex items-center gap-2 text-[#444] text-[11px]">
+                    <Loader2 size={11} className="animate-spin text-[#22c55e]" />
+                    <span>Đang dịch…</span>
+                  </div>
+                )}
+                {translateResult ? (
+                  <p className="text-[11px] text-[#ccc] leading-relaxed whitespace-pre-wrap">{translateResult}</p>
+                ) : !translating ? (
+                  <p className="text-[11px] text-[#333] italic">Bản dịch sẽ xuất hiện ở đây…</p>
+                ) : null}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Footer */}
       <div className="px-4 py-1.5 border-t border-[#1a1a1a] flex items-center gap-4 text-[10px] text-[#333] shrink-0">

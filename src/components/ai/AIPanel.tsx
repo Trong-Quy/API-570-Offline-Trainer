@@ -16,11 +16,11 @@ interface AIPanelProps {
 }
 
 const QUICK_PROMPTS = [
-  "Explain why this answer is correct",
-  "Give me a practical field example",
-  "What API/ASME clause applies?",
-  "What are common exam traps for this topic?",
-  "Summarize this concept in simple terms",
+  "Explain step-by-step why the correct answer is right and why each wrong option is incorrect",
+  "Give a practical field example: describe a real piping system type this applies to, who does what, and what the inspector checks on-site",
+  "Which specific API 570 or ASME clause applies? Quote the requirement in one sentence",
+  "What are the most common exam traps and misconceptions for this topic?",
+  "Summarize this concept in 2–3 plain sentences a new inspector could understand",
 ];
 
 const OFFLINE_RESPONSES: Record<string, string> = {
@@ -66,7 +66,17 @@ async function queryOllama(endpoint: string, model: string, prompt: string, sign
 }
 
 function buildSystemPrompt(question?: Question): string {
-  const base = `You are an expert API 570 Piping Inspector certification trainer. You help candidates understand piping inspection codes, ASME B31.3, API standards, and practical field inspection concepts. Be concise, accurate, and reference the relevant API/ASME clauses when applicable.`;
+  const base = `You are an expert API 570 Piping Inspector certification trainer. You help candidates understand piping inspection codes, ASME B31.3, API standards, and practical field inspection concepts. Be concise, accurate, and reference the relevant API/ASME clauses when applicable.
+
+CALCULATION RULES — follow strictly for any math problem:
+1. Identify and state the unit of every variable before calculating.
+2. Critical unit definitions:
+   - mpy = mils per year (1 mil = 0.001 inch = 0.0254 mm). mpy is NOT mm/year.
+   - Work in ONE unit system throughout (all inches OR all mm — never mix).
+   - Only convert units when the problem explicitly requires it.
+3. Write the formula first, then substitute values with units attached.
+4. Verify units cancel correctly before computing the number.
+5. Never reverse-engineer from an expected answer — derive step by step.`;
   if (!question) return base;
   return `${base}
 
